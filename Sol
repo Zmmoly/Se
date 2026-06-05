@@ -5,8 +5,8 @@ import time
 from math import floor
 
 # ===== إعدادات الـ API =====
-API_KEY = 'mx0vgl3fgDyhUKTQx2'
-API_SECRET = '76983468337d4b978f671f48dbdb7d6a'
+API_KEY = 'mx0vglbytW0px48B4X'
+API_SECRET = '256d281b7cc644088c371dbafd0f1545'
 BASE_URL = 'https://api.mexc.com'
 SYMBOL = 'SOLUSDT'
 
