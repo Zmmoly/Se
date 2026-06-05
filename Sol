@@ -1,0 +1,171 @@
+import hmac
+import hashlib
+import requests
+import time
+from math import floor
+
+# ===== إعدادات الـ API =====
+API_KEY = 'mx0vgl3fgDyhUKTQx2'
+API_SECRET = '76983468337d4b978f671f48dbdb7d6a'
+BASE_URL = 'https://api.mexc.com'
+SYMBOL = 'SOLUSDT'
+
+# ===== إعدادات الاستراتيجية =====
+GRID_STEP = 0.2      # الفرق بين كل طلب وآخر
+MIN_ORDER_USD = 5       # الحد الأدنى لقيمة الطلب بالدولار
+MAX_DIFF = 1000         # أقصى فرق سعر قبل التنظيف
+active_orders = {}      # لتتبع الطلبات المفتوحة
+pending_balances = {"USDT": [], "SOL": []}
+
+# ===== إحصائيات التداول =====
+total_volume_usdt = 0.0
+trade_count = 0
+last_stats_time = time.time()
+
+# ===== الدوال المساعدة (Authentication & API) =====
+
+def generate_signature(secret_key, query_string):
+    return hmac.new(secret_key.encode(), query_string.encode(), hashlib.sha256).hexdigest()
+
+def auth_headers():
+    return {"X-MEXC-APIKEY": API_KEY}
+
+def get_server_time():
+    url = f"{BASE_URL}/api/v3/time"
+    return int(requests.get(url).json()["serverTime"])
+
+def get_current_price(symbol):
+    url = f"{BASE_URL}/api/v3/ticker/price?symbol={symbol}"
+    return float(requests.get(url).json()['price'])
+
+def get_balances():
+    timestamp = get_server_time()
+    query_string = f"timestamp={timestamp}"
+    signature = generate_signature(API_SECRET, query_string)
+    url = f"{BASE_URL}/api/v3/account?{query_string}&signature={signature}"
+    res = requests.get(url, headers=auth_headers()).json()
+    balances = res.get('balances', [])
+    usdt = float(next((b['free'] for b in balances if b['asset'] == 'USDT'), 0))
+    sol = float(next((b['free'] for b in balances if b['asset'] == 'SOL'), 0))
+    return usdt, sol
+
+def get_open_orders(symbol=SYMBOL):
+    timestamp = get_server_time()
+    query_string = f"symbol={symbol}&timestamp={timestamp}"
+    signature = generate_signature(API_SECRET, query_string)
+    url = f"{BASE_URL}/api/v3/openOrders?{query_string}&signature={signature}"
+    return requests.get(url, headers=auth_headers()).json()
+
+def get_all_orders(symbol=SYMBOL, limit=500):
+    timestamp = get_server_time()
+    query_string = f"symbol={symbol}&limit={limit}&timestamp={timestamp}"
+    signature = generate_signature(API_SECRET, query_string)
+    url = f"{BASE_URL}/api/v3/allOrders?{query_string}&signature={signature}"
+    return requests.get(url, headers=auth_headers()).json()
+
+# ===== إدارة الأوامر =====
+
+def place_order_with_retry(symbol, price, quantity, side, retries=2):
+    for attempt in range(retries + 1):
+        timestamp = get_server_time()
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': 'LIMIT',
+            'timeInForce': 'GTC',
+            'quantity': f"{quantity:.6f}",
+            'price': f"{price:.4f}",
+            'timestamp': str(timestamp)
+        }
+        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+        signature = generate_signature(API_SECRET, query_string)
+        url = f"{BASE_URL}/api/v3/order?{query_string}&signature={signature}"
+
+        try:
+            res_json = requests.post(url, headers=auth_headers()).json()
+            if "orderId" in res_json:
+                print(f"✔️ وضع أمر {side} @ {price:.4f}")
+                active_orders[res_json['orderId']] = {"side": side, "price": price, "quantity": quantity}
+                return res_json
+            elif res_json.get("code") == 700003:
+                continue
+            else:
+                print(f"❌ فشل الأمر {side}: {res_json}")
+                return None
+        except Exception as e:
+            print(f"⚠️ خطأ في الاتصال: {e}")
+            time.sleep(1)
+    return None
+
+def cancel_order(order_id):
+    timestamp = get_server_time()
+    query_string = f"symbol={SYMBOL}&orderId={order_id}&timestamp={timestamp}"
+    signature = generate_signature(API_SECRET, query_string)
+    url = f"{BASE_URL}/api/v3/order?{query_string}&signature={signature}"
+    res = requests.delete(url, headers=auth_headers()).json()
+    if order_id in active_orders:
+        del active_orders[order_id]
+    return res
+
+# ===== منطق الشبكة (Grid Logic) =====
+
+def get_usable_balances(usdt_balance, sol_balance):
+    res_usdt = sum(info['price'] * info['quantity'] for info in active_orders.values() if info['side'] == 'BUY')
+    res_sol = sum(info['quantity'] for info in active_orders.values() if info['side'] == 'SELL')
+    p_usdt = sum(e['amount'] for e in pending_balances['USDT'])
+    p_sol = sum(e['amount'] for e in pending_balances['SOL'])
+    return max(0.0, usdt_balance - res_usdt - p_usdt), max(0.0, sol_balance - res_sol - p_sol)
+
+def rebalance_network(current_price, usdt_balance, sol_balance):
+    u_usdt, u_sol = get_usable_balances(usdt_balance, sol_balance)
+    num_buy = floor(u_usdt / MIN_ORDER_USD)
+    for i in range(num_buy):
+        price = round(current_price - GRID_STEP * (i + 1), 4)
+        qty = round(MIN_ORDER_USD / price, 6)
+        place_order_with_retry(SYMBOL, price, qty, "BUY")
+    sell_qty = round(MIN_ORDER_USD / current_price, 6)
+    num_sell = floor(u_sol / sell_qty) if sell_qty > 0 else 0
+    for i in range(num_sell):
+        price = round(current_price + GRID_STEP * (i + 1), 4)
+        place_order_with_retry(SYMBOL, price, sell_qty, "SELL")
+
+# ===== الدورة الرئيسية للبوت =====
+
+def run_grid_bot():
+    global trade_count, total_volume_usdt, last_stats_time
+    print("🚀 بوت الشبكة بدأ العمل...")
+
+    initial_orders = get_open_orders()
+    for o in initial_orders:
+        active_orders[o['orderId']] = {"side": o['side'], "price": float(o['price']), "quantity": float(o['origQty'])}
+
+    first_run = True
+    while True:
+        try:
+            curr_price = get_current_price(SYMBOL)
+            bal_usdt, bal_sol = get_balances()
+            all_market_orders = get_all_orders()
+            for oid, info in list(active_orders.items()):
+                m_order = next((o for o in all_market_orders if o["orderId"] == oid), None)
+                if m_order and m_order["status"] == "FILLED":
+                    print(f"🟢 تنفيذ {info['side']} @ {info['price']}")
+                    trade_count += 1
+                    total_volume_usdt += (info['price'] * info['quantity'])
+                    if info['side'] == 'BUY':
+                        place_order_with_retry(SYMBOL, round(info['price'] + GRID_STEP, 4), info['quantity'], 'SELL')
+                    else:
+                        place_order_with_retry(SYMBOL, round(info['price'] - GRID_STEP, 4), info['quantity'], 'BUY')
+                    del active_orders[oid]
+            if first_run:
+                rebalance_network(curr_price, bal_usdt, bal_sol)
+                first_run = False
+            if time.time() - last_stats_time > 60:
+                print(f"📊 ملخص: {trade_count} صفقات | حجم التداول: {total_volume_usdt:.2f} USDT")
+                last_stats_time = time.time()
+            time.sleep(2)
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    run_grid_bot()
