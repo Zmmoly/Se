@@ -136,8 +136,10 @@ def run_grid_bot():
     print("🚀 بوت الشبكة بدأ العمل...")
 
     initial_orders = get_open_orders()
-    for o in initial_orders:
-        active_orders[o['orderId']] = {"side": o['side'], "price": float(o['price']), "quantity": float(o['origQty'])}
+    if isinstance(initial_orders, list):
+        for o in initial_orders:
+            if isinstance(o, dict) and 'orderId' in o:
+                active_orders[o['orderId']] = {"side": o['side'], "price": float(o['price']), "quantity": float(o['origQty'])}
 
     first_run = True
     while True:
