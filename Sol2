@@ -1,0 +1,393 @@
+cat > bot_sol.py << 'EOF'
+import modal
+import time
+import json
+import queue
+import base64
+import threading
+from collections import Counter
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from urllib.parse import urlencode
+
+app = modal.App("binance-grid-sol")
+image = modal.Image.debian_slim().pip_install(
+    "requests", "cryptography", "websocket-client")
+
+# ===== الإعدادات =====
+BASE_URL = "https://api.binance.com"
+WS_URL = "wss://ws-api.binance.com:443/ws-api/v3"
+SYMBOL = "SOLUSD1"
+BASE_ASSET = "SOL"
+QUOTE_ASSET = "USD1"
+GRID_STEP = Decimal("0.04")         # فرق 0.20 دولار بين كل أمر
+ORDER_USD = Decimal("6")            # قيمة كل أمر (بعملة USD1)
+MAX_ORDERS_PER_SIDE = 1000000       # بدون سقف عمليًا (الرصيد هو الحد)
+RECONCILE_SECONDS = 60              # مطابقة احتياطية عبر REST
+SYNC_SECONDS = 120                  # مزامنة الشبكة وسد الفراغات
+EXTEND_GRID = True                  # تمديد الشبكة بالرصيد الزائد
+RESERVE_QUOTE = Decimal("0")        # احتياطي من USD1 لا تستخدمه المزامنة
+DRY_RUN = True                      # True = اختبار فقط بدون أوامر حقيقية
+
+
+@app.function(
+    image=image,
+    region="eu",
+    secrets=[modal.Secret.from_name("binance")],  # BINANCE_API_KEY و BINANCE_PRIVATE_KEY
+    timeout=86400,
+    max_containers=1,
+)
+def run_grid_bot():
+    import os
+    import requests
+    import websocket
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+    API_KEY = os.environ["BINANCE_API_KEY"]
+    key = load_pem_private_key(
+        os.environ["BINANCE_PRIVATE_KEY"].encode(), password=None)
+
+    active = {}
+    stats = {"trades": 0, "volume": Decimal("0")}
+    f = {"tick": None, "step": None, "min_notional": Decimal("5"), "max_orders": 200}
+    events = queue.Queue()
+    ws_ready = threading.Event()
+
+    # ===== REST =====
+    def call(method, path, params=None, signed=True):
+        params = dict(params or {})
+        if signed:
+            params["timestamp"] = int(time.time() * 1000)
+            params["recvWindow"] = 5000
+            sig = key.sign(urlencode(params).encode())
+            params["signature"] = base64.b64encode(sig).decode()
+        r = requests.request(method, BASE_URL + path, params=params,
+                             headers={"X-MBX-APIKEY": API_KEY}, timeout=10)
+        if r.status_code in (418, 429):
+            print("⚠️ تجاوز حد الطلبات، انتظار 30 ثانية")
+            time.sleep(30)
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        return r.status_code, data
+
+    def floor_to(x, step):
+        return (Decimal(x) / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+    def load_filters():
+        st, res = call("GET", "/api/v3/exchangeInfo", {"symbol": SYMBOL}, signed=False)
+        if "symbols" not in res:
+            raise SystemExit(f"❌ الزوج {SYMBOL} غير متاح: {res}")
+        info = res["symbols"][0]
+        print(f"ℹ️ حالة الزوج: {info.get('status')}")
+        if "LIMIT_MAKER" not in info.get("orderTypes", []):
+            raise SystemExit("❌ نوع الأمر LIMIT_MAKER غير مدعوم لهذا الزوج")
+        for flt in info["filters"]:
+            t = flt["filterType"]
+            if t == "PRICE_FILTER":
+                f["tick"] = Decimal(flt["tickSize"])
+            elif t == "LOT_SIZE":
+                f["step"] = Decimal(flt["stepSize"])
+            elif t in ("NOTIONAL", "MIN_NOTIONAL"):
+                f["min_notional"] = Decimal(flt["minNotional"])
+            elif t == "MAX_NUM_ORDERS":
+                f["max_orders"] = int(flt["maxNumOrders"])
+        print(f"ℹ️ tick={f['tick']} step={f['step']} min_notional={f['min_notional']} "
+              f"max_orders={f['max_orders']} | LIMIT_MAKER مدعوم")
+
+    def get_price():
+        st, res = call("GET", "/api/v3/ticker/price", {"symbol": SYMBOL}, signed=False)
+        return Decimal(res["price"])
+
+    def get_free():
+        st, res = call("GET", "/api/v3/account")
+        if st != 200:
+            raise RuntimeError(f"فشل جلب الرصيد: {res}")
+        bal = {b["asset"]: Decimal(b["free"]) for b in res.get("balances", [])}
+        return bal.get(QUOTE_ASSET, Decimal("0")), bal.get(BASE_ASSET, Decimal("0"))
+
+    # ===== الأوامر (LIMIT_MAKER) =====
+    def place(side, price, qty, retry=True):
+        price = floor_to(price, f["tick"])
+        qty = floor_to(qty, f["step"])
+        if qty <= 0 or price * qty < f["min_notional"]:
+            print(f"⏭️ تخطي أمر {side} @ {price} (الكمية أو القيمة أقل من الحد الأدنى)")
+            return False
+        params = {
+            "symbol": SYMBOL, "side": side, "type": "LIMIT_MAKER",
+            "quantity": format(qty, "f"), "price": format(price, "f"),
+        }
+        path = "/api/v3/order/test" if DRY_RUN else "/api/v3/order"
+        try:
+            st, res = call("POST", path, params)
+        except Exception as e:
+            print(f"⚠️ خطأ اتصال أثناء وضع {side} @ {price}: {e} (ستصلحه المزامنة)")
+            return False
+        if st != 200:
+            # LIMIT_MAKER يُرفض لو كان سينفذ فورًا كـ taker (الخطأ -2010)
+            if retry and res.get("code") == -2010:
+                cur = get_price()
+                new_price = min(price, cur - f["tick"]) if side == "BUY" else max(price, cur + f["tick"])
+                print(f"↩️ {side} @ {price} كان سينفذ فورًا، إعادة المحاولة @ {new_price}")
+                return place(side, new_price, qty, retry=False)
+            print(f"❌ فشل أمر {side} @ {price}: {res}")
+            return False
+        if DRY_RUN:
+            print(f"🧪 اختبار ناجح: {side} {qty} @ {price}")
+            return True
+        active[res["orderId"]] = {"side": side, "price": price, "qty": qty}
+        print(f"✔️ وضع أمر {side} {qty} @ {price}")
+        time.sleep(0.2)
+        return True
+
+    def build_grid(price):
+        quote, base = get_free()
+        n_buy = min(int(quote // ORDER_USD), MAX_ORDERS_PER_SIDE)
+        for i in range(n_buy):
+            p = price - GRID_STEP * (i + 1)
+            place("BUY", p, ORDER_USD / p)
+        sell_qty = floor_to(ORDER_USD / price, f["step"])
+        n_sell = min(int(base // sell_qty), MAX_ORDERS_PER_SIDE) if sell_qty > 0 else 0
+        for i in range(n_sell):
+            place("SELL", price + GRID_STEP * (i + 1), sell_qty)
+        print(f"📐 الشبكة: {n_buy} شراء | {n_sell} بيع | {QUOTE_ASSET}={quote} {BASE_ASSET}={base}")
+
+    # ===== مزامنة الشبكة: سد الفراغات وتمديدها بالرصيد الزائد =====
+    def sync_grid():
+        st, opens = call("GET", "/api/v3/openOrders", {"symbol": SYMBOL})
+        if st != 200 or not isinstance(opens, list) or not opens:
+            return
+
+        # تبنّي أي أمر مفتوح غير متتبَّع (مثلًا قُبل أثناء انقطاع الاتصال)
+        for o in opens:
+            if o["orderId"] not in active:
+                active[o["orderId"]] = {"side": o["side"], "price": Decimal(o["price"]),
+                                        "qty": Decimal(o["origQty"])}
+                print(f"🔎 تم تبنّي أمر غير متتبَّع {o['side']} @ {o['price']}")
+
+        price_now = get_price()
+        step = GRID_STEP
+        # نقطة ارتكاز الشبكة = الباقي الأكثر تكرارًا لأسعار الأوامر
+        r = Counter(Decimal(o["price"]) % step for o in opens).most_common(1)[0][0]
+
+        def idx(p):
+            return int(((p - r) / step).to_integral_value(rounding=ROUND_HALF_UP))
+
+        buys = {idx(Decimal(o["price"])) for o in opens if o["side"] == "BUY"}
+        sells = {idx(Decimal(o["price"])) for o in opens if o["side"] == "SELL"}
+
+        quote, base = get_free()
+        quote_left = max(Decimal("0"), quote - RESERVE_QUOTE)
+        base_left = base
+        slots = f["max_orders"] - len(opens) - 2
+        todo_buy, todo_sell = [], []
+
+        # ثغرات داخل منطقة أوامر الشراء / أوامر البيع
+        if buys:
+            for k in range(min(buys), max(buys)):
+                if k not in buys and k not in sells:
+                    todo_buy.append(k)
+        if sells:
+            for k in range(min(sells) + 1, max(sells)):
+                if k not in sells and k not in buys:
+                    todo_sell.append(k)
+        # الوسط: يُسمح بفراغ واحد فقط (الأقرب للسعر الحالي)
+        if buys and sells:
+            middle = list(range(max(buys) + 1, min(sells)))
+            if len(middle) > 1:
+                hole = min(middle, key=lambda k: abs(r + step * k - price_now))
+                for k in middle:
+                    if k == hole:
+                        continue
+                    (todo_buy if r + step * k < price_now else todo_sell).append(k)
+
+        todo_buy.sort(reverse=True)
+        todo_sell.sort()
+        done = 0
+
+        for k in todo_buy:
+            L = r + step * k
+            if done >= slots or quote_left < ORDER_USD:
+                break
+            if place("BUY", L, ORDER_USD / L):
+                quote_left -= ORDER_USD
+                done += 1
+        for k in todo_sell:
+            L = r + step * k
+            q = floor_to(ORDER_USD / L, f["step"])
+            if done >= slots or q <= 0 or base_left < q:
+                break
+            if place("SELL", L, q):
+                base_left -= q
+                done += 1
+
+        # تمديد الشبكة بالرصيد الزائد
+        if EXTEND_GRID:
+            if buys:
+                k = min(buys) - 1
+                while done < slots and quote_left >= ORDER_USD:
+                    L = r + step * k
+                    if L <= 0 or not place("BUY", L, ORDER_USD / L):
+                        break
+                    quote_left -= ORDER_USD
+                    done += 1
+                    k -= 1
+            if sells:
+                k = max(sells) + 1
+                while done < slots:
+                    L = r + step * k
+                    q = floor_to(ORDER_USD / L, f["step"])
+                    if q <= 0 or base_left < q:
+                        break
+                    if not place("SELL", L, q):
+                        break
+                    base_left -= q
+                    done += 1
+                    k += 1
+
+        if done:
+            print(f"🛠️ مزامنة الشبكة: وُضع {done} أمر (ثغرات + تمديد)")
+
+    # ===== WebSocket: أحداث تنفيذ الأوامر لحظيًا =====
+    def ws_listener():
+        while True:
+            try:
+                ws = websocket.create_connection(WS_URL, timeout=30)
+                ts = int(time.time() * 1000)
+                payload = f"apiKey={API_KEY}&timestamp={ts}"
+                sig = base64.b64encode(key.sign(payload.encode())).decode()
+                ws.send(json.dumps({
+                    "id": "sub1",
+                    "method": "userDataStream.subscribe.signature",
+                    "params": {"apiKey": API_KEY, "timestamp": ts, "signature": sig},
+                }))
+                resp = json.loads(ws.recv())
+                if resp.get("status") != 200:
+                    print(f"❌ فشل اشتراك WebSocket: {resp}")
+                    ws.close()
+                    time.sleep(10)
+                    continue
+                print("🔌 WebSocket متصل ومشترك في أحداث الأوامر")
+                ws_ready.set()
+                ws.settimeout(60)
+                while True:
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        ws.ping()
+                        continue
+                    if not raw:
+                        raise ConnectionError("الاتصال أُغلق")
+                    msg = json.loads(raw)
+                    ev = msg.get("event")
+                    if ev and ev.get("e") == "executionReport" and ev.get("s") == SYMBOL:
+                        events.put(ev)
+                    elif ev and ev.get("e") == "eventStreamTerminated":
+                        raise ConnectionError("انتهى الاشتراك")
+            except Exception as e:
+                ws_ready.clear()
+                print(f"⚠️ انقطع WebSocket ({e})، إعادة الاتصال بعد 5 ثوانٍ")
+                time.sleep(5)
+
+    # ===== معالجة التنفيذ =====
+    def handle_status(oid, status, executed):
+        info = active.get(oid)
+        if info is None:
+            return
+        if status == "FILLED":
+            del active[oid]
+            print(f"🟢 تنفيذ {info['side']} @ {info['price']}")
+            stats["trades"] += 1
+            stats["volume"] += info["price"] * executed
+            if info["side"] == "BUY":
+                try:
+                    _, base_free = get_free()
+                    qty = min(executed, base_free)
+                except Exception as e:
+                    print(f"⚠️ تعذّر جلب الرصيد ({e})، سيُستخدم حجم التنفيذ")
+                    qty = executed
+                place("SELL", info["price"] + GRID_STEP, qty)
+            else:
+                place("BUY", info["price"] - GRID_STEP, executed)
+        elif status in ("CANCELED", "EXPIRED", "REJECTED", "EXPIRED_IN_MATCH"):
+            del active[oid]
+            print(f"⚪ الأمر {oid} صار {status}")
+
+    def reconcile():
+        """مطابقة احتياطية عبر REST لو فاتنا حدث من WebSocket."""
+        st, opens = call("GET", "/api/v3/openOrders", {"symbol": SYMBOL})
+        if st != 200 or not isinstance(opens, list):
+            return
+        open_ids = {o["orderId"] for o in opens}
+        for oid in list(active.keys()):
+            if oid in open_ids:
+                continue
+            st, o = call("GET", "/api/v3/order", {"symbol": SYMBOL, "orderId": oid})
+            if st == 200:
+                handle_status(oid, o.get("status"), Decimal(o["executedQty"]))
+
+    # ===== التشغيل =====
+    print(f"🚀 بوت الشبكة ({SYMBOL}) بدأ على Modal | DRY_RUN={DRY_RUN}")
+    load_filters()
+
+    cur_price = get_price()
+    pct = GRID_STEP / cur_price * 100
+    print(f"💲 السعر الحالي: {cur_price} | الفرق {GRID_STEP} = {pct:.3f}% من السعر")
+    if pct > 5:
+        raise SystemExit("❌ الفرق كبير جدًا مقارنة بالسعر، عدّل GRID_STEP")
+
+    threading.Thread(target=ws_listener, daemon=True).start()
+
+    st, opens = call("GET", "/api/v3/openOrders", {"symbol": SYMBOL})
+    if isinstance(opens, list):
+        for o in opens:
+            active[o["orderId"]] = {"side": o["side"], "price": Decimal(o["price"]),
+                                    "qty": Decimal(o["origQty"])}
+    print(f"📋 أوامر مفتوحة موجودة: {len(active)}")
+
+    if not active:
+        build_grid(cur_price)
+    else:
+        sync_grid()
+
+    if DRY_RUN:
+        ok = ws_ready.wait(timeout=15)
+        print("✅ اختبار WebSocket نجح" if ok else "❌ اختبار WebSocket فشل (راجع الرسائل أعلاه)")
+        print("✅ انتهى الاختبار. غيّر DRY_RUN إلى False للتشغيل الحقيقي.")
+        return
+
+    last_stats = time.time()
+    last_recon = time.time()
+    last_sync = time.time()
+    while True:
+        try:
+            try:
+                ev = events.get(timeout=5)
+                handle_status(ev["i"], ev["X"], Decimal(ev["z"]))
+            except queue.Empty:
+                pass
+
+            if time.time() - last_recon > RECONCILE_SECONDS:
+                reconcile()
+                last_recon = time.time()
+
+            if time.time() - last_sync > SYNC_SECONDS:
+                sync_grid()
+                last_sync = time.time()
+
+            if time.time() - last_stats > 60:
+                print(f"📊 ملخص: {stats['trades']} صفقات | الحجم: {stats['volume']:.2f} {QUOTE_ASSET} | أوامر نشطة: {len(active)}")
+                last_stats = time.time()
+        except Exception as e:
+            print(f"❌ خطأ غير متوقع: {e}")
+            time.sleep(5)
+
+
+@app.local_entrypoint()
+def main():
+    if DRY_RUN:
+        run_grid_bot.remote()
+    else:
+        run_grid_bot.spawn()
+        print(f"✅ تم إطلاق بوت {SYMBOL}. راقبه: modal app logs binance-grid-sol")
+EOF
